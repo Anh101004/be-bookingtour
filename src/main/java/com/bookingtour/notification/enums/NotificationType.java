@@ -1,0 +1,18 @@
+package com.bookingtour.notification.enums;
+
+public enum NotificationType {
+    BOOKING_CONFIRMED,
+    BOOKING_CANCELLED,
+    TOUR_REMINDER,
+    PAYMENT_DUE,
+    PAYMENT_CONFIRMED,
+    CANCELLATION_APPROVED,
+    CANCELLATION_REJECTED,
+    REVIEW_REPLY,
+    PROMOTION,
+    SYSTEM,
+    DEPARTURE_REMINDER,
+    REVIEW_REMINDER,
+    REVIEW_RECEIVED,
+    NEW_REVIEW
+}
