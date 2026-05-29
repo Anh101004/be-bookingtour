@@ -244,6 +244,17 @@ public class PaymentServiceImpl implements IPaymentService {
 
     @Override
     @PreAuthorize("hasRole('ADMIN')")
+    @Transactional(readOnly = true)
+    public List<RefundResponse> getAllRefunds() {
+        return refundRepository
+                .findAllByOrderByRequestedAtDesc()
+                .stream()
+                .map(paymentMapper::toRefundResponse)
+                .toList();
+    }
+
+    @Override
+    @PreAuthorize("hasRole('ADMIN')")
     @Transactional
     public RefundResponse createRefund(RefundRequest request) {
         Booking booking = findBookingById(request.getBookingId());

@@ -22,6 +22,9 @@ public interface IPaymentService {
     PaymentResponse createPayment(PaymentCreateRequest request);
 
     // Admin: xác nhận đã nhận tiền
+
+    List<RefundResponse> getAllRefunds();
+
     PaymentResponse confirmPayment(String paymentId, PaymentConfirmRequest request);
 
     // Admin: hủy thanh toán pending

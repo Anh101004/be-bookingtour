@@ -13,4 +13,6 @@ public interface PaymentRefundRepository extends JpaRepository<PaymentRefund, St
     List<PaymentRefund> findAllByBookingIdOrderByRequestedAtDesc(String bookingId);
 
     List<PaymentRefund> findAllByRefundStatusOrderByRequestedAtDesc(RefundStatus status);
+    List<PaymentRefund> findAllByOrderByRequestedAtDesc();
+
 }

@@ -50,6 +50,12 @@ public class PaymentController {
                 paymentService.getByBookingId(bookingId)));
     }
 
+    @GetMapping("/refunds")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ApiResponse<List<RefundResponse>> getAllRefunds() {
+        return ApiResponse.success(paymentService.getAllRefunds());
+    }
+
     /**
      * GET /api/payments/{paymentId}
      * Chi tiết 1 lần thanh toán

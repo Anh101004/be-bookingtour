@@ -23,4 +23,6 @@ public interface IAnalyticsService {
     // Chi phí vận hành (mới)
     CostBreakdownResponse getCostBreakdown(LocalDate from, LocalDate to);
     CostBreakdownResponse getCostBreakdownBySchedule(String scheduleId);
+    // Thêm vào interface IAnalyticsService
+    RefundAnalyticsResponse getRefundAnalytics(LocalDate from, LocalDate to);
 }

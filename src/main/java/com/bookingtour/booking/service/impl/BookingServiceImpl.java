@@ -236,6 +236,23 @@ public class BookingServiceImpl implements IBookingService {
     @Override
     @PreAuthorize("hasRole('ADMIN')")
     @Transactional(readOnly = true)
+    public List<CancellationResponse> getAllCancellations() {
+        return cancellationRepository
+                .findAllByOrderByRequestedAtDesc()   // hoặc findAll() sort theo requestedAt
+                .stream()
+                .map(c -> {
+                    CancellationResponse r = bookingMapper.toCancellationResponse(c);
+                    bookingRepository.findById(c.getBookingId())
+                            .ifPresent(b -> r.setBookingCode(b.getBookingCode()));
+                    return r;
+                })
+                .toList();
+    }
+
+
+    @Override
+    @PreAuthorize("hasRole('ADMIN')")
+    @Transactional(readOnly = true)
     public List<BookingResponse> getByScheduleId(String scheduleId) {
         return bookingRepository.findAllBySchedule_ScheduleIdOrderByCreatedAtDesc(scheduleId)
                 .stream().map(bookingMapper::toResponse).toList();

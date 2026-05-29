@@ -14,6 +14,8 @@ public interface CancellationRequestRepository extends JpaRepository<Cancellatio
     List<CancellationRequest> findAllByUserIdOrderByRequestedAtDesc(String userId);
 
     List<CancellationRequest> findAllByStatusOrderByRequestedAtDesc(CancellationStatus status);
+    List<CancellationRequest> findAllByOrderByRequestedAtDesc();
+
 
     Optional<CancellationRequest> findByBookingIdAndStatus(
             String bookingId, CancellationStatus status);

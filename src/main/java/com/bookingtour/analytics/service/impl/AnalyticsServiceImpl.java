@@ -2,6 +2,7 @@ package com.bookingtour.analytics.service.impl;
 
 import com.bookingtour.analytics.dto.response.*;
 import com.bookingtour.analytics.service.IAnalyticsService;
+import com.bookingtour.auth.entity.User;
 import com.bookingtour.auth.repository.UserRepository;
 import com.bookingtour.booking.entity.Booking;
 import com.bookingtour.booking.enums.BookingPaymentStatus;
@@ -13,6 +14,7 @@ import com.bookingtour.exception.AppException;
 import com.bookingtour.exception.ErrorCode;
 import com.bookingtour.guide.entity.TourGuide;
 import com.bookingtour.guide.repository.TourGuideRepository;
+import com.bookingtour.payment.entity.PaymentRefund;
 import com.bookingtour.payment.enums.PaymentMethod;
 import com.bookingtour.payment.enums.PaymentStatus;
 import com.bookingtour.payment.enums.RefundStatus;
@@ -60,7 +62,7 @@ public class AnalyticsServiceImpl implements IAnalyticsService {
 
     /**
      * Lương HDV mặc định / lịch khởi hành.
-     * Chỉ tính cho các lịch có ít nhất 1 booking COMPLETED + FULLY_PAID.
+     * Chỉ tính cho các lịch có ít nhất 1 booking CONFIRMED/DEPOSITED/COMPLETED.
      */
     private static final BigDecimal GUIDE_SALARY_PER_TOUR = BigDecimal.valueOf(2_000_000);
 
@@ -81,7 +83,14 @@ public class AnalyticsServiceImpl implements IAnalyticsService {
         long totalTours    = tourRepository.count();
         long totalBookings = allBookings.size();
 
-        BigDecimal totalRevenue = sumRevenue(allBookings);
+        // ✅ Doanh thu thực = paidAmount (active bookings) - refundedAmount
+        BigDecimal grossRevenue = sumRevenue(allBookings);
+        BigDecimal totalRefunded = allBookings.stream()
+                .map(Booking::getRefundAmount)
+                .filter(Objects::nonNull)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal totalRevenue = grossRevenue.subtract(totalRefunded).max(BigDecimal.ZERO);
+
         BigDecimal revenueThisMonth = bookingRepository.sumRevenueByDateRange(startOfMonth, now);
 
         long bookingsThisMonth = allBookings.stream()
@@ -156,36 +165,45 @@ public class AnalyticsServiceImpl implements IAnalyticsService {
     public RevenueStatsResponse getRevenueStats(LocalDate from, LocalDate to) {
         List<Booking> bookings = filterByDate(from, to);
 
-        BigDecimal totalRevenue = bookings.stream()
+        // ✅ Tiền thực thu từ booking active (CONFIRMED / DEPOSITED / COMPLETED)
+        BigDecimal paidRevenue = bookings.stream()
                 .filter(b -> b.getStatus() == BookingStatus.CONFIRMED
                         || b.getStatus() == BookingStatus.DEPOSITED
                         || b.getStatus() == BookingStatus.COMPLETED)
-                .map(Booking::getTotalAmount)
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
-
-        BigDecimal paidRevenue = bookings.stream()
                 .map(Booking::getPaidAmount)
+                .filter(Objects::nonNull)
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
 
-        BigDecimal pendingRevenue = bookings.stream()
-                .filter(b -> b.getStatus() != BookingStatus.CANCELLED)
-                .map(Booking::getRemainingAmount)
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
-
+        // ✅ Tổng tiền đã hoàn trả (refund PROCESSED) — với null-safe
         BigDecimal refundedAmount = bookings.stream()
                 .map(Booking::getRefundAmount)
+                .filter(Objects::nonNull)
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
 
+        // ✅ Doanh thu thực = tiền thu - tiền hoàn, không để âm
+        BigDecimal totalRevenue = paidRevenue.subtract(refundedAmount).max(BigDecimal.ZERO);
+
+        // ✅ Tiền còn chờ thu: chỉ booking chưa hoàn tất, clamp về 0 (không âm)
+        BigDecimal pendingRevenue = bookings.stream()
+                .filter(b -> b.getStatus() == BookingStatus.PENDING
+                        || b.getStatus() == BookingStatus.DEPOSITED
+                        || b.getStatus() == BookingStatus.CONFIRMED)
+                .map(Booking::getRemainingAmount)
+                .filter(Objects::nonNull)
+                .map(v -> v.max(BigDecimal.ZERO))
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        // Doanh thu theo phương thức thanh toán (chỉ payment PAID)
         var payments = paymentRepository.findAll().stream()
                 .filter(p -> p.getPaymentStatus() == PaymentStatus.PAID).toList();
         Map<PaymentMethod, BigDecimal> byMethod = new EnumMap<>(PaymentMethod.class);
         payments.forEach(p -> byMethod.merge(p.getPaymentMethod(), p.getAmount(), BigDecimal::add));
 
         return RevenueStatsResponse.builder()
-                .totalRevenue(totalRevenue)
-                .paidRevenue(paidRevenue)
-                .pendingRevenue(pendingRevenue)
-                .refundedAmount(refundedAmount)
+                .totalRevenue(totalRevenue)           // doanh thu thực (đã trừ hoàn)
+                .paidRevenue(paidRevenue)             // tổng đã thu (gross, chưa trừ hoàn)
+                .pendingRevenue(pendingRevenue)       // tiền chờ thu (≥ 0)
+                .refundedAmount(refundedAmount)       // tổng đã hoàn
                 .revenueByMonth(buildMonthlyRevenueMap(bookings))
                 .cashRevenue(byMethod.getOrDefault(PaymentMethod.CASH, BigDecimal.ZERO))
                 .bankTransferRevenue(byMethod.getOrDefault(PaymentMethod.BANK_TRANSFER, BigDecimal.ZERO))
@@ -284,8 +302,6 @@ public class AnalyticsServiceImpl implements IAnalyticsService {
         }
 
         // ── 2. Nhóm booking theo schedule_id ─────────────────────────────────
-        //    key  = scheduleId
-        //    value = danh sách booking qualified của schedule đó
         Map<String, List<Booking>> bookingsBySchedule = qualifiedBookings.stream()
                 .collect(Collectors.groupingBy(b -> b.getSchedule().getScheduleId()));
 
@@ -294,9 +310,6 @@ public class AnalyticsServiceImpl implements IAnalyticsService {
         List<TourSchedule> schedules = scheduleRepository.findAllById(scheduleIds);
 
         // ── 4. Chi phí KHÁCH SẠN ─────────────────────────────────────────────
-        // Công thức: pricePerNight (từ HotelRoom) × numRooms × nights
-        // KHÔNG dùng sh.getTotalPrice() vì field này có thể null hoặc
-        // chỉ là snapshot lúc tạo schedule, không phản ánh giá phòng thực tế.
         List<CostBreakdownResponse.HotelCostDetail> hotelDetails = new ArrayList<>();
         BigDecimal totalHotelCost = BigDecimal.ZERO;
 
@@ -307,13 +320,11 @@ public class AnalyticsServiceImpl implements IAnalyticsService {
             for (ScheduleHotel sh : s.getHotels()) {
                 long nights = ChronoUnit.DAYS.between(sh.getCheckInDate(), sh.getCheckOutDate());
 
-                // Lấy giá/đêm từ HotelRoom; fallback về 0 nếu room chưa được gán
                 BigDecimal pricePerNight = (sh.getRoom() != null
                         && sh.getRoom().getPricePerNight() != null)
                         ? sh.getRoom().getPricePerNight()
                         : BigDecimal.ZERO;
 
-                // totalCost = pricePerNight × numRooms × nights
                 BigDecimal cost = pricePerNight
                         .multiply(BigDecimal.valueOf(sh.getNumRooms()))
                         .multiply(BigDecimal.valueOf(nights));
@@ -328,7 +339,7 @@ public class AnalyticsServiceImpl implements IAnalyticsService {
                         .hotelCity(sh.getHotel().getCity())
                         .starRating(sh.getHotel().getStarRating())
                         .roomType(sh.getRoom() != null ? sh.getRoom().getRoomType() : "—")
-                        .pricePerNight(pricePerNight)       // thêm để frontend hiển thị
+                        .pricePerNight(pricePerNight)
                         .numRooms(sh.getNumRooms())
                         .checkInDate(sh.getCheckInDate().format(DATE_FMT))
                         .checkOutDate(sh.getCheckOutDate().format(DATE_FMT))
@@ -341,15 +352,12 @@ public class AnalyticsServiceImpl implements IAnalyticsService {
         }
 
         // ── 5. Chi phí PHƯƠNG TIỆN ───────────────────────────────────────────
-        //    Chi phí chặng = price_per_person × tổng hành khách (adults + children)
-        //    từ các booking qualified của lịch đó
         List<CostBreakdownResponse.VehicleCostDetail> vehicleDetails = new ArrayList<>();
         BigDecimal totalVehicleCost = BigDecimal.ZERO;
 
         for (TourSchedule s : schedules) {
             List<Booking> bks = bookingsBySchedule.get(s.getScheduleId());
 
-            // Tổng hành khách thực tế (đã hoàn thành & thanh toán đủ)
             int actualPassengers = bks.stream()
                     .mapToInt(b -> b.getNumAdults() + b.getNumChildren())
                     .sum();
@@ -382,8 +390,6 @@ public class AnalyticsServiceImpl implements IAnalyticsService {
         }
 
         // ── 6. Chi phí HƯỚNG DẪN VIÊN ────────────────────────────────────────
-        //    Nhóm các lịch đủ điều kiện theo guide
-        //    salaryPerTour × số lịch qualified của guide đó
         List<CostBreakdownResponse.GuideCostDetail> guideDetails = new ArrayList<>();
         BigDecimal totalGuideCost = BigDecimal.ZERO;
 
@@ -420,7 +426,13 @@ public class AnalyticsServiceImpl implements IAnalyticsService {
                 .add(totalVehicleCost)
                 .add(totalGuideCost);
 
-        BigDecimal totalRevenue = sumRevenue(qualifiedBookings);
+        // ✅ Doanh thu cho cost breakdown cũng trừ hoàn tiền
+        BigDecimal grossRevenue = sumRevenue(qualifiedBookings);
+        BigDecimal qualifiedRefunded = qualifiedBookings.stream()
+                .map(Booking::getRefundAmount)
+                .filter(Objects::nonNull)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal totalRevenue = grossRevenue.subtract(qualifiedRefunded).max(BigDecimal.ZERO);
 
         BigDecimal estimatedProfit = totalRevenue.subtract(totalOperatingCost);
         double margin = totalRevenue.compareTo(BigDecimal.ZERO) > 0
@@ -455,6 +467,223 @@ public class AnalyticsServiceImpl implements IAnalyticsService {
     }
 
     // ════════════════════════════════════════════════════════════════════════
+    //  REFUND ANALYTICS
+    // ════════════════════════════════════════════════════════════════════════
+
+    @Override
+    @PreAuthorize("hasRole('ADMIN')")
+    @Transactional(readOnly = true)
+    public RefundAnalyticsResponse getRefundAnalytics(LocalDate from, LocalDate to) {
+
+        // ── 1. Lấy tất cả refund, lọc theo requestedAt ────────────────────
+        List<PaymentRefund> allRefunds = refundRepository.findAllByOrderByRequestedAtDesc()
+                .stream()
+                .filter(r -> {
+                    LocalDate d = r.getRequestedAt().toLocalDate();
+                    return (from == null || !d.isBefore(from))
+                            && (to   == null || !d.isAfter(to));
+                })
+                .toList();
+
+        if (allRefunds.isEmpty()) {
+            return RefundAnalyticsResponse.builder()
+                    .totalRefundRequests(0)
+                    .processedRefunds(0)
+                    .rejectedRefunds(0)
+                    .pendingRefunds(0)
+                    .totalRefundedAmount(BigDecimal.ZERO)
+                    .pendingRefundAmount(BigDecimal.ZERO)
+                    .rejectedRefundAmount(BigDecimal.ZERO)
+                    .approvalRatePercent(0.0)
+                    .refundToRevenueRatePercent(0.0)
+                    .countByRefundPercent(Map.of())
+                    .amountByRefundPercent(Map.of())
+                    .refundByMonth(Map.of())
+                    .countByMonth(Map.of())
+                    .topRefundCustomers(List.of())
+                    .refundDetails(List.of())
+                    .build();
+        }
+
+        // ── 2. Phân nhóm theo status ──────────────────────────────────────
+        Map<RefundStatus, List<PaymentRefund>> byStatus = allRefunds.stream()
+                .collect(Collectors.groupingBy(PaymentRefund::getRefundStatus));
+
+        List<PaymentRefund> processed = byStatus.getOrDefault(RefundStatus.PROCESSED, List.of());
+        List<PaymentRefund> rejected  = byStatus.getOrDefault(RefundStatus.REJECTED,  List.of());
+        List<PaymentRefund> pending   = byStatus.getOrDefault(RefundStatus.PENDING,   List.of());
+
+        BigDecimal totalRefundedAmount = processed.stream()
+                .map(PaymentRefund::getRefundAmount)
+                .filter(Objects::nonNull)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        BigDecimal pendingRefundAmount = pending.stream()
+                .map(PaymentRefund::getRefundAmount)
+                .filter(Objects::nonNull)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        BigDecimal rejectedRefundAmount = rejected.stream()
+                .map(PaymentRefund::getRefundAmount)
+                .filter(Objects::nonNull)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+        // ── 3. Tỷ lệ chấp thuận ──────────────────────────────────────────
+        long total = allRefunds.size();
+        double approvalRate = total > 0
+                ? BigDecimal.valueOf(processed.size())
+                .divide(BigDecimal.valueOf(total), 4, RoundingMode.HALF_UP)
+                .multiply(BigDecimal.valueOf(100)).doubleValue()
+                : 0.0;
+
+        // ── 4. Tỷ lệ hoàn / doanh thu ────────────────────────────────────
+        // ✅ Dùng doanh thu thực (đã trừ hoàn) để tính tỷ lệ
+        List<Booking> periodBookings = filterByDate(from, to);
+        BigDecimal grossRevenue = sumRevenue(periodBookings);
+        BigDecimal periodRefunded = periodBookings.stream()
+                .map(Booking::getRefundAmount)
+                .filter(Objects::nonNull)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal netRevenue = grossRevenue.subtract(periodRefunded).max(BigDecimal.ZERO);
+
+        double refundToRevenueRate = netRevenue.compareTo(BigDecimal.ZERO) > 0
+                ? totalRefundedAmount
+                .divide(netRevenue, 4, RoundingMode.HALF_UP)
+                .multiply(BigDecimal.valueOf(100)).doubleValue()
+                : 0.0;
+
+        // ── 5. Phân bổ theo % chính sách hoàn ───────────────────────────
+        Map<String, Long>       countByPct  = new LinkedHashMap<>();
+        Map<String, BigDecimal> amountByPct = new LinkedHashMap<>();
+        List.of("0%", "30%", "50%", "70%").forEach(k -> {
+            countByPct.put(k, 0L);
+            amountByPct.put(k, BigDecimal.ZERO);
+        });
+        allRefunds.forEach(r -> {
+            String key = r.getRefundPercent() + "%";
+            countByPct.merge(key, 1L, Long::sum);
+            amountByPct.merge(key,
+                    r.getRefundAmount() != null ? r.getRefundAmount() : BigDecimal.ZERO,
+                    BigDecimal::add);
+        });
+
+        // ── 6. Phân bổ theo tháng ────────────────────────────────────────
+        DateTimeFormatter fmt = DateTimeFormatter.ofPattern("yyyy-MM");
+        Map<String, BigDecimal> refundByMonth = new LinkedHashMap<>();
+        Map<String, Long>       countByMonth  = new LinkedHashMap<>();
+        YearMonth cur = YearMonth.now();
+        for (int i = 11; i >= 0; i--) {
+            String k = cur.minusMonths(i).format(fmt);
+            refundByMonth.put(k, BigDecimal.ZERO);
+            countByMonth.put(k, 0L);
+        }
+        processed.forEach(r -> {
+            if (r.getProcessedAt() == null) return;
+            String k = r.getProcessedAt().format(fmt);
+            refundByMonth.computeIfPresent(k, (key, v) ->
+                    v.add(r.getRefundAmount() != null ? r.getRefundAmount() : BigDecimal.ZERO));
+            countByMonth.computeIfPresent(k, (key, v) -> v + 1);
+        });
+
+        // ── 7. Top khách hoàn tiền nhiều nhất ────────────────────────────
+        Map<String, List<PaymentRefund>> byBooking = processed.stream()
+                .collect(Collectors.groupingBy(PaymentRefund::getBookingId));
+
+        Map<String, BigDecimal> refundByUser = new HashMap<>();
+        Map<String, Long>       countByUser  = new HashMap<>();
+        Map<String, String>     nameByUser   = new HashMap<>();
+        Map<String, String>     emailByUser  = new HashMap<>();
+
+        byBooking.forEach((bookingId, refunds) ->
+                bookingRepository.findById(bookingId).ifPresent(booking -> {
+                    String uid = booking.getUserId();
+                    BigDecimal sum = refunds.stream()
+                            .map(PaymentRefund::getRefundAmount)
+                            .filter(Objects::nonNull)
+                            .reduce(BigDecimal.ZERO, BigDecimal::add);
+                    refundByUser.merge(uid, sum, BigDecimal::add);
+                    countByUser.merge(uid, (long) refunds.size(), Long::sum);
+                    userRepository.findById(uid).ifPresent(u -> {
+                        nameByUser.put(uid, u.getFullName());
+                        emailByUser.put(uid, u.getEmail());
+                    });
+                }));
+
+        List<RefundAnalyticsResponse.TopRefundCustomer> topCustomers = refundByUser.entrySet()
+                .stream()
+                .sorted(Map.Entry.<String, BigDecimal>comparingByValue().reversed())
+                .limit(10)
+                .map(e -> RefundAnalyticsResponse.TopRefundCustomer.builder()
+                        .userId(e.getKey())
+                        .fullName(nameByUser.getOrDefault(e.getKey(), "—"))
+                        .email(emailByUser.getOrDefault(e.getKey(), "—"))
+                        .refundCount(countByUser.getOrDefault(e.getKey(), 0L))
+                        .totalRefundedAmount(e.getValue())
+                        .build())
+                .toList();
+
+        // ── 8. Chi tiết từng yêu cầu hoàn tiền ──────────────────────────
+        List<RefundAnalyticsResponse.RefundDetail> details = allRefunds.stream()
+                .map(r -> {
+                    String     bookingCode  = "—";
+                    String     userId       = "—";
+                    String     customerName = "—";
+                    String     tourTitle    = "—";
+                    BigDecimal origAmt      = BigDecimal.ZERO;
+
+                    var bookingOpt = bookingRepository.findById(r.getBookingId());
+                    if (bookingOpt.isPresent()) {
+                        Booking b = bookingOpt.get();
+                        bookingCode = b.getBookingCode();
+                        userId      = b.getUserId();
+                        tourTitle   = b.getSchedule().getTour().getTitle();
+                        var userOpt = userRepository.findById(userId);
+                        if (userOpt.isPresent()) customerName = userOpt.get().getFullName();
+                    }
+                    var payOpt = paymentRepository.findById(r.getPaymentId());
+                    if (payOpt.isPresent()) origAmt = payOpt.get().getAmount();
+
+                    return RefundAnalyticsResponse.RefundDetail.builder()
+                            .refundId(r.getRefundId())
+                            .bookingCode(bookingCode)
+                            .userId(userId)
+                            .customerName(customerName)
+                            .tourTitle(tourTitle)
+                            .originalPaymentAmount(origAmt)
+                            .refundPercent(r.getRefundPercent())
+                            .refundAmount(r.getRefundAmount())
+                            .daysBeforeTour(r.getDaysBeforeTour())
+                            .refundReason(r.getRefundReason())
+                            .refundStatus(r.getRefundStatus().name())
+                            .requestedAt(r.getRequestedAt().format(DT_FMT))
+                            .processedAt(r.getProcessedAt() != null
+                                    ? r.getProcessedAt().format(DT_FMT) : "—")
+                            .note(r.getNote())
+                            .build();
+                })
+                .toList();
+
+        // ── 9. Trả kết quả ───────────────────────────────────────────────
+        return RefundAnalyticsResponse.builder()
+                .totalRefundRequests(total)
+                .processedRefunds(processed.size())
+                .rejectedRefunds(rejected.size())
+                .pendingRefunds(pending.size())
+                .totalRefundedAmount(totalRefundedAmount)
+                .pendingRefundAmount(pendingRefundAmount)
+                .rejectedRefundAmount(rejectedRefundAmount)
+                .approvalRatePercent(approvalRate)
+                .refundToRevenueRatePercent(refundToRevenueRate)
+                .countByRefundPercent(countByPct)
+                .amountByRefundPercent(amountByPct)
+                .refundByMonth(refundByMonth)
+                .countByMonth(countByMonth)
+                .topRefundCustomers(topCustomers)
+                .refundDetails(details)
+                .build();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
     //  PRIVATE HELPERS
     // ════════════════════════════════════════════════════════════════════════
 
@@ -469,12 +698,6 @@ public class AnalyticsServiceImpl implements IAnalyticsService {
         }).toList();
     }
 
-    /**
-     * Lọc booking ĐỒNG THỜI thoả mãn:
-     *   status         = COMPLETED
-     *   payment_status = FULLY_PAID
-     * Lọc theo departure_date của schedule (thời điểm tour thực sự kết thúc).
-     */
     /**
      * Lọc booking đủ điều kiện tính chi phí vận hành.
      * Bao gồm: CONFIRMED, DEPOSITED, COMPLETED — loại trừ PENDING và CANCELLED.
@@ -496,7 +719,8 @@ public class AnalyticsServiceImpl implements IAnalyticsService {
     }
 
     /**
-     * Tổng doanh thu thực thu = paid_amount của booking CONFIRMED/DEPOSITED/COMPLETED.
+     * Tổng doanh thu gross = paidAmount của booking CONFIRMED/DEPOSITED/COMPLETED.
+     * Lưu ý: đây là gross, chưa trừ refund. Việc trừ hoàn làm ở tầng gọi.
      */
     private BigDecimal sumRevenue(List<Booking> bookings) {
         return bookings.stream()
@@ -504,6 +728,7 @@ public class AnalyticsServiceImpl implements IAnalyticsService {
                         || b.getStatus() == BookingStatus.DEPOSITED
                         || b.getStatus() == BookingStatus.COMPLETED)
                 .map(Booking::getPaidAmount)
+                .filter(Objects::nonNull)
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
     }
 
@@ -514,17 +739,27 @@ public class AnalyticsServiceImpl implements IAnalyticsService {
         long total     = bks.size();
         long completed = bks.stream().filter(b -> b.getStatus() == BookingStatus.COMPLETED).count();
         long cancelled = bks.stream().filter(b -> b.getStatus() == BookingStatus.CANCELLED).count();
-        BigDecimal revenue = bks.stream()
+
+        // ✅ Doanh thu tour = paidAmount - refundAmount (net)
+        BigDecimal grossRevenue = bks.stream()
                 .filter(b -> b.getStatus() == BookingStatus.CONFIRMED
                         || b.getStatus() == BookingStatus.DEPOSITED
                         || b.getStatus() == BookingStatus.COMPLETED)
                 .map(Booking::getPaidAmount)
+                .filter(Objects::nonNull)
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal tourRefunded = bks.stream()
+                .map(Booking::getRefundAmount)
+                .filter(Objects::nonNull)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal revenue = grossRevenue.subtract(tourRefunded).max(BigDecimal.ZERO);
+
         double rate = total > 0
                 ? BigDecimal.valueOf(cancelled)
                 .divide(BigDecimal.valueOf(total), 4, RoundingMode.HALF_UP)
                 .multiply(BigDecimal.valueOf(100)).doubleValue()
                 : 0.0;
+
         return TourPerformanceResponse.builder()
                 .tourId(tour.getTourId())
                 .tourTitle(tour.getTitle())
@@ -562,7 +797,7 @@ public class AnalyticsServiceImpl implements IAnalyticsService {
                         || b.getStatus() == BookingStatus.COMPLETED)
                 .forEach(b -> result.computeIfPresent(
                         b.getCreatedAt().format(fmt),
-                        (k, v) -> v.add(b.getPaidAmount())));
+                        (k, v) -> v.add(b.getPaidAmount() != null ? b.getPaidAmount() : BigDecimal.ZERO)));
         return result;
     }
 }

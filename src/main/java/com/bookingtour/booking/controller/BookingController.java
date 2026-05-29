@@ -49,6 +49,11 @@ public class BookingController {
     public ResponseEntity<ApiResponse<List<BookingResponse>>> getMyBookings() {
         return ResponseEntity.ok(ApiResponse.success(bookingService.getMyBookings()));
     }
+    @GetMapping("/cancellations")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ApiResponse<List<CancellationResponse>> getAllCancellations() {
+        return ApiResponse.success(bookingService.getAllCancellations());
+    }
 
     /**
      * GET /api/bookings/my/{bookingId}

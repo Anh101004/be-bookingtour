@@ -89,4 +89,10 @@ public class AnalyticsController {
         return ResponseEntity.ok(ApiResponse.success(
                 analyticsService.getCostBreakdownBySchedule(scheduleId)));
     }
+    @GetMapping("/refund-analytics")
+    public ResponseEntity<RefundAnalyticsResponse> getRefundAnalytics(
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to) {
+        return ResponseEntity.ok(analyticsService.getRefundAnalytics(from, to));
+    }
 }

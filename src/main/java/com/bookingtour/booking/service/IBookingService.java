@@ -23,6 +23,8 @@ public interface IBookingService {
 
     // Admin
     List<BookingResponse> getAll();
+    List<CancellationResponse> getAllCancellations();
+
 
     List<BookingResponse> getByStatus(BookingStatus status);
 
